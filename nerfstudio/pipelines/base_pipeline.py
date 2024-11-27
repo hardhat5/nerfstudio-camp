@@ -274,6 +274,7 @@ class VanillaPipeline(Pipeline):
             device=device,
             grad_scaler=grad_scaler,
             seed_points=seed_pts,
+            train_cameras=self.datamanager.train_dataset.cameras,
         )
         self.model.to(device)
 

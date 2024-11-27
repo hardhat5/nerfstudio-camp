@@ -224,6 +224,7 @@ def launch(
 
 
 def main(config: TrainerConfig) -> None:
+
     """Main function."""
 
     if config.data:

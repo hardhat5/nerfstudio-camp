@@ -145,6 +145,9 @@ class NerfactoModel(Model):
         """Set the fields and modules."""
         super().populate_modules()
 
+        if "train_cameras" in self.kwargs:
+            self.train_cameras: Cameras = self.kwargs["train_cameras"]
+
         if self.config.disable_scene_contraction:
             scene_contraction = None
         else:
@@ -173,7 +176,7 @@ class NerfactoModel(Model):
         )
 
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
-            num_cameras=self.num_train_data, device="cpu"
+            num_cameras=self.num_train_data, device="cpu", cameras=self.train_cameras
         )
         self.density_fns = []
         num_prop_nets = self.config.num_proposal_iterations

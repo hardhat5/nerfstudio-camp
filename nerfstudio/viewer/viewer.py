@@ -381,7 +381,8 @@ class Viewer:
         idxs = list(self.camera_handles.keys())
         with torch.no_grad():
             assert isinstance(camera_optimizer, CameraOptimizer)
-            c2ws_delta = camera_optimizer(torch.tensor(idxs, device=camera_optimizer.device)).cpu().numpy()
+            _, c2ws_delta = camera_optimizer(torch.tensor(idxs, device=camera_optimizer.device))
+            c2ws_delta = c2ws_delta.cpu().numpy()
         for i, key in enumerate(idxs):
             # both are numpy arrays
             c2w_orig = self.original_c2w[key]
