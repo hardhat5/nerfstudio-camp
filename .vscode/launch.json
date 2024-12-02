@@ -5,6 +5,34 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "Python: train nerfacto nerfstudio",
+      "type": "python",
+      "request": "launch",
+      "program": "nerfstudio/scripts/train.py",
+      "console": "integratedTerminal",
+      "args": [
+        "nerfacto",
+        // "--logging.local-writer.max-log-size=0",
+        "--project_name=nerfstudio_project",
+        "--experiment_name=nerfstudio_experiment",
+        // "--vis=wandb",
+
+        // viewer
+        // "--viewer.enable",
+        // "--viewer.zmq-url=tcp://127.0.0.1:6001",
+        // "--viewer.websocket-port=8014",
+        // "--pipeline.model.randomize-background",
+        // "--pipeline.model.cone-angle=0.00390625",
+        
+        // data & data-parsing
+        "--data=data/nerfstudio/poster",
+        // "nerfstudio-data"
+      ],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0" // Set the GPUs you want to be visible
+        }
+    },
+    {
       "name": "Launch Chrome against localhost",
       "request": "launch",
       "type": "chrome",
