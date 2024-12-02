@@ -70,6 +70,8 @@ class CameraOptimizerConfig(InstantiateConfig):
     distortion_std_penalty: float = .1
     start_focal_train: int = 3000
 
+    use_preconditioning: bool = True
+
     def __post_init__(self):
         if self.optimizer is not None:
             import warnings
@@ -92,6 +94,141 @@ class CameraOptimizerConfig(InstantiateConfig):
                 style="bold yellow",
             )
             warnings.warn("above message coming from", FutureWarning, stacklevel=3)
+
+class CameraPreconditioner(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.precondition_num_points = 1000  # The number of points used to compute the preconditioning matrix.
+        self.precondition_near = 1  # The near plane depth of the point sampling frustum.
+        self.precondition_far = 1000  # The far plane depth of the point sampling frustum.
+
+    def _unproject_points(self, points, depths, cameras):
+        """
+            Unproject 2D pixel coordinates to depth-scaled 3D points.
+            Note: points_3d is returned in camera coordinates.
+        """
+        K_inverse = torch.linalg.inv(cameras.get_intrinsics_matrices())
+
+        # Unproject points into normalized camera coordinates
+        points = torch.cat([points, torch.ones((points.shape[0],points.shape[1],1))], dim=-1)
+        points = (K_inverse @ points.transpose(1,2)).transpose(1,2)
+
+        # scale by depth (P2 -> R3)
+        points_3d = points * depths.unsqueeze(-1)
+
+        # # transform to world coordinates
+        # points_3d = torch.cat([points_3d, torch.ones(points_3d.shape[0],points_3d.shape[1],1)], dim=-1)
+        # c2ws = self.cameras.camera_to_worlds
+        # points_3d = torch.matmul(c2ws, points_3d.transpose(1,2)).transpose(1,2)
+
+        return points_3d
+
+    def _create_points_from_frustum(self, cameras):
+        """
+            Create points from frustum corners.
+            Ensure different cameras have different sampled points.
+            TODO: Set PyTorch seed somewhere.
+        
+        """
+        
+        # Create frustum corners
+        img_width = cameras.width[0].item()  # assume all cameras have the same width
+        img_height = cameras.height[0].item()  # assume all cameras have the same height
+
+        # Choose random integer points for all cameras
+        frustum_pixels = torch.stack([
+            torch.randint(0, img_height, (len(cameras), self.precondition_num_points)),
+            torch.randint(0, img_width, (len(cameras), self.precondition_num_points))
+        ], dim=2).to(cameras.device)
+
+        # choose integer depth points in the scene
+        depths = torch.randint(low=self.precondition_near, high=self.precondition_far, size=(len(cameras), self.precondition_num_points)).to(cameras.device)
+
+        # unproject to get 3D points, keep in camera space for ease of calculations later
+        return self._unproject_points(frustum_pixels, depths, cameras)
+
+    def _project_points(self, camera_params, points_3d, cameras):
+        """
+            Project 3D points to 2D pixel coordinates.
+            Note: points_3d is already in camera coordinates.
+            # TODO: This is an implementation of the SE(3)+focal length projection equation.
+                    In the future, we should make this an abstact method, to be defined in child classes.
+        """
+        # # Transform to camera coordinates
+        # points_3d = torch.cat([points_3d, torch.ones(points_3d.shape[0],points_3d.shape[1],1)], dim=-1)
+        # c2ws = self.cameras.camera_to_worlds
+        # points_3d = torch.matmul(c2ws, points_3d.transpose(1,2)).transpose(1,2)
+
+        # get camera intrinsics
+        # TODO: apply camera correction updates
+        K = cameras.get_intrinsics_matrices()
+
+        # project to image space
+        # points_3d = torch.cat([points_3d, torch.ones(points_3d.shape[0],points_3d.shape[1],1)], dim=-1)
+        pixels = torch.matmul(K, points_3d.transpose(1,2)).transpose(1,2)
+        pixels = pixels/pixels[..., 2, None]
+
+        # un-homogenize
+        return pixels[..., :2]
+
+    def _compute_jacobian(self, fn, x, *args):
+        """
+            Compute the Jacobian of a function fn at x.
+            Returns the Jacobian matrix and projected pixels.
+            TODO: Re-check the implementation of this method.
+        """
+        points = args[0]
+        points = points.detach().requires_grad_(True)
+        nc, m, _ = points.shape  # Number of cameras, number of points
+        x = x.detach().requires_grad_(True)  # Ensure x is differentiable
+
+        # project 3D points to 2D pixel coordinates
+        y = fn(x, *args)  # Expected shape: (nc, m, 2)
+
+        # Initialize the Jacobian matrix
+        jacobian = torch.zeros(nc, m, 2, x.shape[-1], device=x.device)  # Shape: (nc, m, 2, x.shape[-1])
+
+        # Compute gradients for each 2D point across cameras
+        # TODO: Check if this can be parallelized
+        # TODO: Fix x.grad None because x:camera_params is not being used for projection. Refer to previous function TODO
+        # Temporarily commented out until issue is fixed.
+        
+        # for c in range(nc):  
+        #     for i in range(m): 
+        #         for j in range(2):
+        #             if x.grad is not None:
+        #                 x.grad.zero_()
+
+        #             # Backpropagate the gradient of y[c, i, j] w.r.t. x[c]
+        #             y[c, i, j].backward(retain_graph=True)
+        #             jacobian[c, i, j] = x.grad[c]
+
+        return jacobian, y
+
+    def _compute_approximate_hessian(self, camera_params, cameras, points_3d):
+        """
+            Compute the approximate Hessian matrix.
+            TODO: Finish implementing this method.
+        """
+        j, pixels = self._compute_jacobian(self._project_points, camera_params, points_3d, cameras)
+
+        # TODO: ignore pixels outside of camera viewpoint
+        pixels = None
+        jtj = None
+
+        # TODO: do xTx stuff, check for valid pixels
+        return jtj
+
+    def _calculate_jtj(self, camera_params, cameras):
+        """Compute the approximate Hessian matrix"""
+        points_3d = self._create_points_from_frustum(cameras)
+        jtj = self._compute_approximate_hessian(camera_params, cameras, points_3d)
+        return jtj
+        
+    def get_camera_preconditioner(self, camera_params, cameras):
+        """Get the preconditioner for the camera parameters"""
+        return self._calculate_jtj(camera_params, cameras)
+        
 
 
 class CameraOptimizer(nn.Module):
@@ -132,16 +269,22 @@ class CameraOptimizer(nn.Module):
         if self.config.mode == "off":
             pass
         elif self.config.mode in ("SO3xR3", "SE3"):
-            self.pose_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 6), device=device))
+            if self.config.optimize_intrinsics:
+                if self.cameras is None:
+                    raise ValueError("cameras must be provided to optimize intrinsics")
+                # optimize pose, fx, fy, cx, cy
+                self.camera_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 12), device=device))
+            else:
+                # only optimize pose
+                self.pose_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 6), device=device))
         else:
             assert_never(self.config.mode)
 
-        if self.config.optimize_intrinsics:
-            if self.cameras is None:
-                raise ValueError("cameras must be provided to optimize intrinsics")
-            # optimize fx, fy, cx, cy
-            self.K_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 4), device=device))
-            self.D_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 2), device=device))
+        # initialize preconditioner and calculate P matrix
+        if self.config.use_preconditioning:
+            self.preconditioner = CameraPreconditioner()
+            self.P_matrix = self.preconditioner.get_camera_preconditioner(self.camera_adjustment.detach(), cameras)
+            self.P_matrix = torch.eye(12, device=device)[None, ...].repeat(num_cameras, 1, 1)  # override with dummy P matrix for debugging
 
     def forward(
         self,
@@ -155,6 +298,17 @@ class CameraOptimizer(nn.Module):
             to given camera coordinates.
         """
         outputs = []
+
+        if self.config.use_preconditioning:
+            # apply pre-conditioning to entire camera delta tensor
+            preconditioned_camera_adjustment = torch.bmm(self.P_matrix.to(indices.device), self.camera_adjustment[..., None]).squeeze()
+
+            # index relevant fields to stay consistent with the rest of the code
+            # ensure gradient flow is preserved
+            # TODO: Remove the self attributes, we do not need to store them. For now, just to stay consistent with the rest of the code.
+            self.K_adjustment = preconditioned_camera_adjustment[:, :4]
+            self.D_adjustment = preconditioned_camera_adjustment[:, 4:6]
+            self.pose_adjustment = preconditioned_camera_adjustment[:, 6:]
 
         # Apply learned transformation delta.
         if self.config.mode == "off":
