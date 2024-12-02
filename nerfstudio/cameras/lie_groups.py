@@ -115,3 +115,23 @@ def exp_map_SE3(tangent_vector: Float[Tensor, "b 6"]) -> Float[Tensor, "b 3 4"]:
         tangent_vector_ang @ (tangent_vector_ang.transpose(1, 2) @ tangent_vector_lin)
     )
     return ret
+
+
+def get_rotation_matrix_from_6d_vector(
+    rot_vector: Float[Tensor, "b 6"]
+) -> Float[Tensor, "b 3 3"]:
+    """Convert a 6D rotation vector into a 3x3 rotation matrix
+      The 6D rotation representation is converted into a 3x3 rotation matrix as follows:
+    - `v1` and `v2` are extracted as the first and second 3D vectors, respectively.
+    - `r1` is computed as the normalized `v1`.
+    - `r2` is computed as the component of `v2` orthogonal to `r1`, and then normalized.
+    - `r3` is computed as the cross product of `r1` and `r2`.
+    - The rotation matrix `R` is formed by stacking `r1`, `r2`, and `r3` as columns.
+    """
+    v1 = rot_vector[:, 0:3]
+    v2 = rot_vector[:, 3:6]
+    r1 = v1 / torch.linalg.norm(v1, dim=1).unsqueeze(1)
+    r2 = v2 - (v2 * r1).sum(1).unsqueeze(1) * r1
+    r2 = r2 / torch.linalg.norm(r2, dim=1).unsqueeze(1)
+    r3 = torch.cross(r1, r2)
+    return torch.stack([r1, r2, r3], dim=1)
