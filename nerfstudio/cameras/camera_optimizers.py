@@ -30,7 +30,7 @@ from torch import Tensor, nn
 from typing_extensions import assert_never
 
 from nerfstudio.cameras.cameras import Cameras
-from nerfstudio.cameras.lie_groups import exp_map_SE3, exp_map_SO3xR3
+from nerfstudio.cameras.lie_groups import *
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.configs.base_config import InstantiateConfig
 from nerfstudio.engine.optimizers import OptimizerConfig
@@ -44,7 +44,7 @@ class CameraOptimizerConfig(InstantiateConfig):
 
     _target: Type = field(default_factory=lambda: CameraOptimizer)
 
-    mode: Literal["off", "SO3xR3", "SE3"] = "off"
+    mode: Literal["off", "SO3xR3", "SE3", "SE3WithFocalIntrinsics", "SCNeRF", "FocalPoseWithIntrinsics"] = "off"
     """Pose optimization strategy to use. If enabled, we recommend SO3xR3."""
 
     trans_l2_penalty: float = 1e-2
@@ -67,7 +67,7 @@ class CameraOptimizerConfig(InstantiateConfig):
 
     principal_point_penalty: float = 1e-2
     distortion_penalty: float = 1e-1
-    distortion_std_penalty: float = .1
+    distortion_std_penalty: float = 0.1
     start_focal_train: int = 3000
 
     use_preconditioning: bool = True
@@ -262,12 +262,17 @@ class CameraOptimizer(nn.Module):
             self.Ks[:, 0, 2] = (self.cameras.cx / self.cameras.width).squeeze()
             self.Ks[:, 1, 2] = (self.cameras.cy / self.cameras.height).squeeze()
             self.Ksinv = torch.inverse(self.Ks)
+            self.Ds = torch.zeros(2, device=device).repeat(self.c2ws.shape[0], 1) # fix this
         else:
-            self.c2ws = torch.eye(4, device=device)[None, :3, :4].repeat(num_cameras, 1, 1)
+            self.c2ws = torch.eye(4, device=device)[None, :3, :4].repeat(
+                num_cameras, 1, 1
+            )
 
         # Initialize learnable parameters.
         if self.config.mode == "off":
             pass
+        elif self.cameras is None:
+            raise ValueError("cameras must be provided to optimize parameters")
         elif self.config.mode in ("SO3xR3", "SE3"):
             if self.config.optimize_intrinsics:
                 if self.cameras is None:
@@ -276,7 +281,52 @@ class CameraOptimizer(nn.Module):
                 self.camera_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 12), device=device))
             else:
                 # only optimize pose
-                self.pose_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 6), device=device))
+                self.pose_adjustment = torch.nn.Parameter(
+                torch.zeros((num_cameras, 6), device=device)
+            )
+            self.config.optimize_intrinsics = False
+        elif self.config.mode == "SE3WithFocalIntrinsics":
+            self.pose_adjustment = torch.nn.Parameter(
+                torch.zeros((num_cameras, 6), device=device)
+            )
+            self.config.optimize_intrinsics = True # bjhamb - uncouple config.optimize_intrinsics from mode
+            # optimize fx, fy, cx, cy
+            self.K_adjustment = torch.nn.Parameter(
+                torch.zeros((num_cameras, 4), device=device)
+            )
+            # optimize k1, k2
+            self.D_adjustment = torch.nn.Parameter(
+                torch.zeros((num_cameras, 2), device=device)
+            )
+        elif self.config.mode == "SCNeRF":
+            # SCNeRF has 6D rotation vector and a 3D translation vector
+            self.pose_adjustment = torch.nn.Parameter(
+                torch.zeros((num_cameras, 9), device=device)
+            )
+            self.config.optimize_intrinsics = True
+            # optimize fx, fy, cx, cy
+            self.K_adjustment = torch.nn.Parameter(
+                torch.zeros((num_cameras, 4), device=device)
+            )
+            # optimize k1, k2
+            self.D_adjustment = torch.nn.Parameter(
+                torch.zeros((num_cameras, 2), device=device)
+            )
+        elif self.config.mode == "FocalPoseWithIntrinsics":
+            # FocalPoseWithIntrinsics has 3 elements for translation and 3 elements for rotation
+            self.config.optimize_intrinsics = True
+            self.pose_adjustment = torch.nn.Parameter(
+                torch.zeros((num_cameras, 9), device=device)
+            )
+            # optimize f, cx, cy  (assume fx = fy)
+            self.K_adjustment = torch.nn.Parameter(
+                torch.zeros((num_cameras, 3), device=device)
+            )            
+            self.config.focal_std_penalty = self.config.focal_std_penalty[:3] 
+            # take only the first 3 elements as K_adjustment has only 3 elements
+            self.D_adjustment = torch.nn.Parameter(
+                torch.zeros((num_cameras, 2), device=device)
+            )
         else:
             assert_never(self.config.mode)
 
@@ -299,6 +349,14 @@ class CameraOptimizer(nn.Module):
         """
         outputs = []
 
+        if self.Ks.device != self.pose_adjustment.device:
+            self.Ks = self.Ks.to(self.pose_adjustment.device)
+            self.Ksinv = self.Ksinv.to(self.pose_adjustment.device)
+        K_corrected = self.Ks[indices]
+        if self.Ds.device != self.pose_adjustment.device:
+            self.Ds = self.Ds.to(self.pose_adjustment.device)
+        D_corrected = self.Ds[indices]
+
         if self.config.use_preconditioning:
             # apply pre-conditioning to entire camera delta tensor
             preconditioned_camera_adjustment = torch.bmm(self.P_matrix.to(indices.device), self.camera_adjustment[..., None]).squeeze()
@@ -317,6 +375,70 @@ class CameraOptimizer(nn.Module):
             outputs.append(exp_map_SO3xR3(self.pose_adjustment[indices, :]))
         elif self.config.mode == "SE3":
             outputs.append(exp_map_SE3(self.pose_adjustment[indices, :]))
+        elif self.config.mode == "SE3WithFocalIntrinsics":
+            # update it to only use pose part (first 6 elements)
+            outputs.append(exp_map_SE3(self.pose_adjustment[indices, :]))
+            K_corrected[:, 0, 0] *= torch.exp(self.K_adjustment[indices, 0])
+            K_corrected[:, 1, 1] *= torch.exp(self.K_adjustment[indices, 1])
+            K_corrected[:, 0, 2] += self.K_adjustment[indices, 2]
+            K_corrected[:, 1, 2] += self.K_adjustment[indices, 3]
+            D_corrected[:, 0] += self.D_adjustment[indices, 0]
+            D_corrected[:, 1] += self.D_adjustment[indices, 1]
+        elif self.config.mode == "SCNeRF":
+            # extract rotation matrix from 1st 6 elements
+            R = get_rotation_matrix_from_6d_vector(self.pose_adjustment[indices, 0:6])
+            translation_vector = self.pose_adjustment[indices, 6:9]
+            ret = torch.zeros(
+                translation_vector.shape[0],
+                3,
+                4,
+                dtype=translation_vector.dtype,
+                device=translation_vector.device,
+            )
+            ret[:, :3, :3] = R  # Set the rotation part
+            ret[:, :3, 3] = translation_vector  # Set the translation part
+            outputs.append(ret)
+            K_corrected[:, 0, 0] += torch.exp(self.K_adjustment[indices, 0])
+            K_corrected[:, 1, 1] += torch.exp(self.K_adjustment[indices, 1])
+            K_corrected[:, 0, 2] += self.K_adjustment[indices, 2]
+            K_corrected[:, 1, 2] += self.K_adjustment[indices, 3]
+            D_corrected[:, 0] += self.D_adjustment[indices, 0]
+            D_corrected[:, 1] += self.D_adjustment[indices, 1]
+        elif self.config.mode == "FocalPoseWithIntrinsics":
+            R = get_rotation_matrix_from_6d_vector(self.pose_adjustment[indices, 0:6])
+            vx = self.pose_adjustment[indices, 6]
+            vy = self.pose_adjustment[indices, 7]
+            vz = self.pose_adjustment[indices, 8]
+            f = self.Ks[indices, 0, 0]
+            self.c2ws = self.c2ws.to(self.pose_adjustment.device) #bjhamb
+            x = self.c2ws[indices, 0, 3]
+            y = self.c2ws[indices, 1, 3] 
+            z = self.c2ws[indices, 2, 3]
+
+            f_new = torch.exp(self.K_adjustment[indices, 0]) * f
+            z_new = torch.exp(vz) * z
+            x_new = (vx / f_new + x / z) * z_new
+            y_new = (vy / f_new + y / z) * z_new
+
+            trans = torch.stack([x_new - x, y_new - y, z_new - z], dim=1)
+            ret = torch.zeros(
+                    R.shape[0],
+                    3,
+                    4,
+                    dtype=R.dtype,
+                    device=R.device,
+                )
+
+            ret[:, :3, :3] = R  # Set the rotation part
+            ret[:, :3, 3] = trans  # Set the translation part
+            outputs.append(ret)
+            # assumes fx = fy
+            K_corrected[:, 0, 0] *= torch.exp(self.K_adjustment[indices, 0])
+            K_corrected[:, 1, 1] *= torch.exp(self.K_adjustment[indices, 0])
+            K_corrected[:, 0, 2] += self.K_adjustment[indices, 1]
+            K_corrected[:, 1, 2] += self.K_adjustment[indices, 2]
+            D_corrected[:, 0] += self.D_adjustment[indices, 0]
+            D_corrected[:, 1] += self.D_adjustment[indices, 1]
         else:
             assert_never(self.config.mode)
         # Detach non-trainable indices by setting to identity transform
@@ -330,22 +452,10 @@ class CameraOptimizer(nn.Module):
             # Note that using repeat() instead of tile() here would result in unnecessary copies.
             return torch.eye(4, device=self.device)[None, :3, :4].tile(indices.shape[0], 1, 1)
         pose_corrections = functools.reduce(pose_utils.multiply, outputs)
-
-        # next multiply in the focal corrections if provided
-        # optimize them separately
-        if self.Ks.device != self.pose_adjustment.device:
-            self.Ks = self.Ks.to(self.pose_adjustment.device)
-            self.Ksinv = self.Ksinv.to(self.pose_adjustment.device)
-        K_cors = self.Ks[indices]
-        if self.config.optimize_intrinsics:
-            K_cors[:, 0, 0] *= torch.exp(self.K_adjustment[indices, 0])
-            K_cors[:, 1, 1] *= torch.exp(self.K_adjustment[indices, 1])
-            K_cors[:, 0, 2] += self.K_adjustment[indices, 2]
-            K_cors[:, 1, 2] += self.K_adjustment[indices, 3]
-        return K_cors, pose_corrections
+        return K_corrected, pose_corrections
 
     # def apply_to_raybundle(self, raybundle: RayBundle) -> None:
-    #     """Apply the pose correction to the raybundle"""        
+    #     """Apply the pose correction to the raybundle"""
     #     if self.config.mode != "off":
     #         correction_matrices = self(raybundle.camera_indices.squeeze())  # type: ignore
     #         raybundle.origins = raybundle.origins + correction_matrices[:, :3, 3]
@@ -355,9 +465,10 @@ class CameraOptimizer(nn.Module):
         """Apply the pose correction to the raybundle"""
         
         if self.config.mode != "off":
-            K_cors, H_cors = self(raybundle.camera_indices.squeeze())  # type: ignore
-            if self.c2ws.device != K_cors.device:
-                self.c2ws = self.c2ws.to(K_cors.device)
+            K_corrected, H_corrected = self(raybundle.camera_indices.squeeze())  # type: ignore
+            D_corrected = self.Ds[raybundle.camera_indices.squeeze()]
+            if self.c2ws.device != K_corrected.device:
+                self.c2ws = self.c2ws.to(K_corrected.device)
 
             if self.config.optimize_intrinsics:
             
@@ -383,23 +494,23 @@ class CameraOptimizer(nn.Module):
                 r4 = r2**2.0
                 radial = (
                     1.0
-                    + r2 * self.D_adjustment[raybundle.camera_indices, 0]
-                    + r4 * self.D_adjustment[raybundle.camera_indices, 1]
+                    + r2 * D_corrected[raybundle.camera_indices, 0]
+                    + r4 * D_corrected[raybundle.camera_indices, 1]
                 )
                 raybundle.directions = raybundle.directions * torch.cat(
                     (radial, radial, torch.ones((*radial.shape[:-1], 1), device=radial.device, dtype=radial.dtype)), dim=-1
                 )
 
                 # Get ray directions in camera space using corrected intrinsics matrix
-                raybundle.directions = torch.bmm(torch.inverse(K_cors), raybundle.directions[..., None]).squeeze()
+                raybundle.directions = torch.bmm(torch.inverse(K_corrected), raybundle.directions[..., None]).squeeze()
                 raybundle.directions = raybundle.directions / raybundle.directions.norm(dim=-1, keepdim=True)
 
                 # Transform rays back to world space
                 raybundle.directions = torch.bmm(Hs[..., :3, :3], raybundle.directions[..., None]).squeeze()
 
             # Apply pose correction to rays
-            raybundle.directions = torch.bmm(H_cors[:, :3, :3], raybundle.directions[..., None]).squeeze()
-            raybundle.origins = raybundle.origins + H_cors[:, :3, 3]
+            raybundle.directions = torch.bmm(H_corrected[:, :3, :3], raybundle.directions[..., None]).squeeze()
+            raybundle.origins = raybundle.origins + H_corrected[:, :3, 3]
 
     def apply_to_camera(self, camera: Cameras) -> torch.Tensor:
         """Apply the pose correction to the world-to-camera matrix in a Camera object"""
@@ -436,6 +547,11 @@ class CameraOptimizer(nn.Module):
                 self.pose_adjustment[:, :3].norm(dim=-1).mean() * self.config.trans_l2_penalty
                 + self.pose_adjustment[:, 3:].norm(dim=-1).mean() * self.config.rot_l2_penalty
             )
+            # option 1 : somehow get  SE3 transform here, and then get the translation and rotation from it
+            # use the translation as it is, and for rotation find se3 to calculate the norm
+
+            # option 2 : directly calculate the norm of the 6D vector
+            # does it even make sense to have a penalty on the 6D vector?
 
             if self.config.optimize_intrinsics:
                 
