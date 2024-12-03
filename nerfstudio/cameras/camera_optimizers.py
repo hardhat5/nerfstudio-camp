@@ -44,7 +44,7 @@ class CameraOptimizerConfig(InstantiateConfig):
 
     _target: Type = field(default_factory=lambda: CameraOptimizer)
 
-    mode: Literal["off", "SO3xR3", "SE3"] = "off"
+    mode: Literal["off", "SO3xR3", "SE3", "SE3WithFocalIntrinsics", "SCNeRF", "FocalPoseWithIntrinsics"] = "off"
     """Pose optimization strategy to use. If enabled, we recommend SO3xR3."""
 
     trans_l2_penalty: float = 1e-2
@@ -172,12 +172,14 @@ class CameraOptimizer(nn.Module):
             # FocalPoseWithIntrinsics has 3 elements for translation and 3 elements for rotation
             self.config.optimize_intrinsics = True
             self.pose_adjustment = torch.nn.Parameter(
-                torch.zeros((num_cameras, 6), device=device)
+                torch.zeros((num_cameras, 9), device=device)
             )
             # optimize f, cx, cy  (assume fx = fy)
             self.K_adjustment = torch.nn.Parameter(
                 torch.zeros((num_cameras, 3), device=device)
-            )
+            )            
+            self.config.focal_std_penalty = self.config.focal_std_penalty[:3] 
+            # take only the first 3 elements as K_adjustment has only 3 elements
             self.D_adjustment = torch.nn.Parameter(
                 torch.zeros((num_cameras, 2), device=device)
             )
@@ -223,7 +225,7 @@ class CameraOptimizer(nn.Module):
             D_corrected[:, 1] += self.D_adjustment[indices, 1]
         elif self.config.mode == "SCNeRF":
             # extract rotation matrix from 1st 6 elements
-            R = get_rotation_matrix_from_6d_vector(self.pose_adjustment[indices, :6])
+            R = get_rotation_matrix_from_6d_vector(self.pose_adjustment[indices, 0:6])
             translation_vector = self.pose_adjustment[indices, 6:9]
             ret = torch.zeros(
                 translation_vector.shape[0],
@@ -243,25 +245,27 @@ class CameraOptimizer(nn.Module):
             D_corrected[:, 1] += self.D_adjustment[indices, 1]
         elif self.config.mode == "FocalPoseWithIntrinsics":
             R = get_rotation_matrix_from_6d_vector(self.pose_adjustment[indices, 0:6])
-            vx, vy, vz = self.pose_adjustment[indices, 6:9]
-            vf = self.pose_adjustment[indices, 10]
+            vx = self.pose_adjustment[indices, 6]
+            vy = self.pose_adjustment[indices, 7]
+            vz = self.pose_adjustment[indices, 8]
             f = self.Ks[indices, 0, 0]
-            x = self.c2ws[indices, 0, 3] 
+            self.c2ws = self.c2ws.to(self.pose_adjustment.device) #bjhamb
+            x = self.c2ws[indices, 0, 3]
             y = self.c2ws[indices, 1, 3] 
             z = self.c2ws[indices, 2, 3]
 
-            f_new = torch.exp(vf) * f
+            f_new = torch.exp(self.K_adjustment[indices, 0]) * f
             z_new = torch.exp(vz) * z
             x_new = (vx / f_new + x / z) * z_new
             y_new = (vy / f_new + y / z) * z_new
 
             trans = torch.stack([x_new - x, y_new - y, z_new - z], dim=1)
             ret = torch.zeros(
-                    self.pose_adjustment.shape[0],
+                    R.shape[0],
                     3,
                     4,
-                    dtype=self.pose_adjustment.dtype,
-                    device=self.pose_adjustment.device,
+                    dtype=R.dtype,
+                    device=R.device,
                 )
 
             ret[:, :3, :3] = R  # Set the rotation part
@@ -301,6 +305,7 @@ class CameraOptimizer(nn.Module):
         
         if self.config.mode != "off":
             K_corrected, H_corrected = self(raybundle.camera_indices.squeeze())  # type: ignore
+            D_corrected = self.Ds[raybundle.camera_indices.squeeze()]
             if self.c2ws.device != K_corrected.device:
                 self.c2ws = self.c2ws.to(K_corrected.device)
 
@@ -328,8 +333,8 @@ class CameraOptimizer(nn.Module):
                 r4 = r2**2.0
                 radial = (
                     1.0
-                    + r2 * self.D_corrected[raybundle.camera_indices, 0]
-                    + r4 * self.D_corrected[raybundle.camera_indices, 1]
+                    + r2 * D_corrected[raybundle.camera_indices, 0]
+                    + r4 * D_corrected[raybundle.camera_indices, 1]
                 )
                 raybundle.directions = raybundle.directions * torch.cat(
                     (radial, radial, torch.ones((*radial.shape[:-1], 1), device=radial.device, dtype=radial.dtype)), dim=-1
