@@ -40,6 +40,8 @@ from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttrib
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import profiler
 
+import functools
+from torch.optim.lr_scheduler import LambdaLR
 
 def module_wrapper(ddp_or_model: Union[DDP, Model]) -> Model:
     """
@@ -218,6 +220,10 @@ class VanillaPipelineConfig(InstantiateConfig):
     """specifies the datamanager config"""
     model: ModelConfig = field(default_factory=ModelConfig)
     """specifies the model config"""
+    eval_optimize_cameras: bool = False
+    """Whether to optimize the cameras during evaluation."""
+    eval_num_pose_iters: int = 5000
+    """Number of iterations to optimize the cameras."""
 
 
 class VanillaPipeline(Pipeline):
@@ -275,6 +281,9 @@ class VanillaPipeline(Pipeline):
             grad_scaler=grad_scaler,
             seed_points=seed_pts,
             train_cameras=self.datamanager.train_dataset.cameras,
+            num_eval_data=len(self.datamanager.eval_dataset),
+            eval_cameras=self.datamanager.eval_dataset.cameras
+
         )
         self.model.to(device)
 
@@ -370,6 +379,10 @@ class VanillaPipeline(Pipeline):
         num_images = len(data_loader)
         if output_path is not None:
             output_path.mkdir(exist_ok=True, parents=True)
+        
+        if self.config.eval_optimize_cameras:
+                self.eval_optimize_camera()
+
         with Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -379,10 +392,13 @@ class VanillaPipeline(Pipeline):
         ) as progress:
             task = progress.add_task("[green]Evaluating all images...", total=num_images)
             idx = 0
+            cameras = data_loader.cameras
+
             for camera, batch in data_loader:
                 # time this the following line
                 inner_start = time()
-                outputs = self.model.get_outputs_for_camera(camera=camera)
+
+                outputs = self.model.get_outputs_for_camera(camera=cameras, idx=idx, val=True)
                 height, width = camera.height, camera.width
                 num_rays = height * width
                 metrics_dict, image_dict = self.model.get_image_metrics_and_images(outputs, batch)
@@ -431,6 +447,67 @@ class VanillaPipeline(Pipeline):
             self.datamanager.fixed_indices_eval_dataloader, image_prefix, step, output_path, get_std
         )
 
+    def eval_optimize_camera(self):
+        """Optimize the camera pose."""
+        # TODO: raise error if the method is not Nerfacto
+
+        # Setup optimizer
+        # import pdb; pdb.set_trace()
+        self.train()
+
+        param_groups = {}
+        self.model.eval_camera_optimizer.get_param_groups(param_groups)
+        optimizer = torch.optim.Adam(param_groups['camera_opt'], lr=1e-3, eps=1e-15)
+
+        # Scheduler configuration
+        lr_initial = 1e-3
+        lr_final = 1e-4
+        max_steps = 5000
+
+        # Exponential decay function
+        def lr_lambda(step):
+            decay_rate = (lr_final / lr_initial) ** (1 / max_steps)
+            return decay_rate ** step
+
+        # Create the scheduler
+        # scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeElapsedColumn(),
+            MofNCompleteColumn(),
+            transient=True,
+        ) as progress:
+            
+            task = progress.add_task("[green]Optimzing eval cameras...", total=self.config.eval_num_pose_iters)
+            for i in range(self.config.eval_num_pose_iters):
+                # optimize the ray generator's camera optimizer
+                optimizer.zero_grad()
+                ray_bundle, batch = self.datamanager.next_eval(i)
+                outputs = self.model.forward(ray_bundle, val=True)
+
+                image = batch["image"].to(self.device)
+                pred_rgb, gt_rgb = self.model.renderer_rgb.blend_background_for_loss_computation(
+                            pred_image=outputs["rgb"],
+                            pred_accumulation=outputs["accumulation"],
+                            gt_image=image,
+                )
+
+                loss_dict = {}
+                loss_dict["rgb"] = self.model.rgb_loss(gt_rgb, pred_rgb)
+                self.model.eval_camera_optimizer.get_loss_dict(loss_dict)
+                loss = functools.reduce(torch.add, loss_dict.values())
+
+                loss.backward()
+                optimizer.step()
+                # scheduler.step()
+
+                progress.advance(task)
+                
+        # done optimizing camera pose
+        self.eval()
+        
     def load_pipeline(self, loaded_state: Dict[str, Any], step: int) -> None:
         """Load the checkpoint from the given path
 

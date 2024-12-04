@@ -579,6 +579,9 @@ class Cameras(TensorDataclass):
         Returns:
             Rays for the given camera indices and coords. RayBundle.shape == num_rays
         """
+
+        disable_distortion = True
+        
         # Make sure we're on the right devices
         camera_indices = camera_indices.to(self.device)
         coords = coords.to(self.device)

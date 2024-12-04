@@ -148,6 +148,12 @@ class NerfactoModel(Model):
         if "train_cameras" in self.kwargs:
             self.train_cameras: Cameras = self.kwargs["train_cameras"]
 
+        if "eval_cameras" in self.kwargs:
+            self.eval_cameras: Cameras = self.kwargs["eval_cameras"]
+
+        if "num_eval_data" in self.kwargs:
+            self.num_eval_data = self.kwargs["num_eval_data"]
+
         if self.config.disable_scene_contraction:
             scene_contraction = None
         else:
@@ -178,6 +184,11 @@ class NerfactoModel(Model):
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu", cameras=self.train_cameras
         )
+        
+        self.eval_camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
+            num_cameras=self.num_eval_data, device="cpu", cameras=self.eval_cameras
+        )
+
         self.density_fns = []
         num_prop_nets = self.config.num_proposal_iterations
         # Build the proposal network(s)
@@ -298,10 +309,15 @@ class NerfactoModel(Model):
             )
         return callbacks
 
-    def get_outputs(self, ray_bundle: RayBundle):
-        # apply the camera optimizer pose tweaks
-        if self.training:
+    def get_outputs(self, ray_bundle: RayBundle, val=False):
+        
+        # apply the camera optimizer tweaks
+        if val:
+            self.eval_camera_optimizer.apply_to_raybundle(ray_bundle)
+        
+        elif self.training:
             self.camera_optimizer.apply_to_raybundle(ray_bundle)
+
         ray_samples: RaySamples
         ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
         field_outputs = self.field.forward(ray_samples, compute_normals=self.config.predict_normals)

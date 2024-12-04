@@ -62,8 +62,17 @@ class CameraOptimizerConfig(InstantiateConfig):
 
     focal_std_penalty: torch.Tensor = torch.tensor([0.1, 0.1, 0.01, 0.01])
 
-    optimize_intrinsics: bool = True
+    optimize_intrinsics: bool = False
     """Whether to optimize focal length."""
+
+    position_noise_std: float = 0.0
+    """Noise to add to initial positions. Useful for debugging."""
+
+    orientation_noise_std: float = 0.0
+    """Noise to add to initial orientations. Useful for debugging."""
+
+    focal_length_noise_std: float = 0.0
+    """Noise to add to initial focal lengths. Useful for debugging."""
 
     principal_point_penalty: float = 1e-2
     distortion_penalty: float = 1e-1
@@ -136,12 +145,33 @@ class CameraOptimizer(nn.Module):
         else:
             assert_never(self.config.mode)
 
-        if self.config.optimize_intrinsics:
+        if self.config.mode != "off" and self.config.optimize_intrinsics:
             if self.cameras is None:
                 raise ValueError("cameras must be provided to optimize intrinsics")
             # optimize fx, fy, cx, cy
             self.K_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 4), device=device))
             self.D_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 2), device=device))
+
+        # Initialize pose noise; useful for debugging.
+        if self.config.position_noise_std != 0.0 or self.config.orientation_noise_std != 0.0:
+            assert self.config.position_noise_std >= 0.0 and self.config.orientation_noise_std >= 0.0
+            std_vector = torch.tensor(
+                [self.config.position_noise_std] * 3 + [self.config.orientation_noise_std] * 3, device=self.device
+            )
+            self.pose_noise = exp_map_SE3(
+                torch.normal(torch.zeros((self.num_cameras, 6), device=self.device), std_vector)
+            )
+        else:
+            self.pose_noise = None
+
+        if self.config.focal_length_noise_std != 0.0:
+            std_vector = torch.tensor(
+                [self.config.focal_length_noise_std] * 2, device=self.device
+            )
+            self.focal_noise = torch.normal(torch.zeros((self.num_cameras, 2), device=self.device), torch.log(std_vector))
+        else:
+            self.focal_noise = None
+            
 
     def forward(
         self,
@@ -174,78 +204,77 @@ class CameraOptimizer(nn.Module):
         # Return: identity if no transforms are needed, otherwise multiply transforms together.
         if len(outputs) == 0:
             # Note that using repeat() instead of tile() here would result in unnecessary copies.
-            return torch.eye(4, device=self.device)[None, :3, :4].tile(indices.shape[0], 1, 1)
+            outputs.append(torch.eye(4, device=indices.device)[None, :3, :4].tile(indices.shape[0], 1, 1))
+
+        # Apply initial pose noise.
+        if self.pose_noise is not None:
+            self.pose_noise = self.pose_noise.to(indices.device)
+            outputs.append(self.pose_noise[indices, :, :])
+        
+        # import pdb; pdb.set_trace()
         pose_corrections = functools.reduce(pose_utils.multiply, outputs)
 
         # next multiply in the focal corrections if provided
         # optimize them separately
-        if self.Ks.device != self.pose_adjustment.device:
-            self.Ks = self.Ks.to(self.pose_adjustment.device)
-            self.Ksinv = self.Ksinv.to(self.pose_adjustment.device)
+        if self.Ks.device != indices.device:
+            self.Ks = self.Ks.to(indices.device)
+            self.Ksinv = self.Ksinv.to(indices.device)
         K_cors = self.Ks[indices]
+
+        if self.focal_noise is not None:
+            self.focal_noise = self.focal_noise.to(indices.device)
+            K_cors[:, 0, 0] *= torch.exp(self.focal_noise[indices, 0])
+            K_cors[:, 1, 1] *= torch.exp(self.focal_noise[indices, 1])
+
         if self.config.optimize_intrinsics:
             K_cors[:, 0, 0] *= torch.exp(self.K_adjustment[indices, 0])
             K_cors[:, 1, 1] *= torch.exp(self.K_adjustment[indices, 1])
             K_cors[:, 0, 2] += self.K_adjustment[indices, 2]
             K_cors[:, 1, 2] += self.K_adjustment[indices, 3]
-        return K_cors, pose_corrections
 
-    # def apply_to_raybundle(self, raybundle: RayBundle) -> None:
-    #     """Apply the pose correction to the raybundle"""        
-    #     if self.config.mode != "off":
-    #         correction_matrices = self(raybundle.camera_indices.squeeze())  # type: ignore
-    #         raybundle.origins = raybundle.origins + correction_matrices[:, :3, 3]
-    #         raybundle.directions = torch.bmm(correction_matrices[:, :3, :3], raybundle.directions[..., None]).squeeze()
+        return K_cors, pose_corrections
 
     def apply_to_raybundle(self, raybundle: RayBundle) -> None:
         """Apply the pose correction to the raybundle"""
+        # if self.config.mode != "off":
+        K_cors, H_cors = self(raybundle.camera_indices.squeeze())  # type: ignore
+        if self.c2ws.device != K_cors.device:
+            self.c2ws = self.c2ws.to(K_cors.device)
         
-        if self.config.mode != "off":
-            K_cors, H_cors = self(raybundle.camera_indices.squeeze())  # type: ignore
-            if self.c2ws.device != K_cors.device:
-                self.c2ws = self.c2ws.to(K_cors.device)
+        # Convert to 4x4 transformation matrix
+        Hs = self.c2ws[raybundle.camera_indices.squeeze()]
+        rows = torch.tensor([0, 0, 0, 1], dtype=Hs.dtype, device=Hs.device)[None, :].repeat(Hs.shape[0], 1, 1)
+        # Get world-to-camera transformations
+        Hs = torch.cat([Hs, rows], dim=1)
+        Hs_inv = torch.inverse(Hs)
+        # Transform directions to camera space and project
+        raybundle.directions = torch.bmm(Hs_inv[:, :3, :3], raybundle.directions[..., None]).squeeze()
+        # Do perspective projection and homogeneous divide
+        Ks = self.Ks[raybundle.camera_indices.squeeze()]
+        raybundle.directions = torch.bmm(Ks, raybundle.directions[..., None]).squeeze()
+        raybundle.directions = raybundle.directions / -raybundle.directions[..., 2:3].repeat(1, 3)
+        # Do radial distortion correction
 
-            if self.config.optimize_intrinsics:
-            
-                # Convert to 4x4 transformation matrix
-                Hs = self.c2ws[raybundle.camera_indices.squeeze()]
-                rows = torch.tensor([0, 0, 0, 1], dtype=Hs.dtype, device=Hs.device)[None, :].repeat(Hs.shape[0], 1, 1)
-
-                # Get world-to-camera transformations
-                Hs = torch.cat([Hs, rows], dim=1)
-                Hs_inv = torch.inverse(Hs)
-
-                # Transform directions to camera space and project
-                raybundle.directions = torch.bmm(Hs_inv[:, :3, :3], raybundle.directions[..., None]).squeeze()
-
-                # Do perspective projection and homogeneous divide
-                Ks = self.Ks[raybundle.camera_indices.squeeze()]
-                raybundle.directions = torch.bmm(Ks, raybundle.directions[..., None]).squeeze()
-                raybundle.directions = raybundle.directions / -raybundle.directions[..., 2:3].repeat(1, 3)
-
-                # Do radial distortion correction
-                r = raybundle.directions[..., :2].norm(dim=-1, keepdim=True)
-                r2 = r**2.0
-                r4 = r2**2.0
-                radial = (
-                    1.0
-                    + r2 * self.D_adjustment[raybundle.camera_indices, 0]
-                    + r4 * self.D_adjustment[raybundle.camera_indices, 1]
-                )
-                raybundle.directions = raybundle.directions * torch.cat(
-                    (radial, radial, torch.ones((*radial.shape[:-1], 1), device=radial.device, dtype=radial.dtype)), dim=-1
-                )
-
-                # Get ray directions in camera space using corrected intrinsics matrix
-                raybundle.directions = torch.bmm(torch.inverse(K_cors), raybundle.directions[..., None]).squeeze()
-                raybundle.directions = raybundle.directions / raybundle.directions.norm(dim=-1, keepdim=True)
-
-                # Transform rays back to world space
-                raybundle.directions = torch.bmm(Hs[..., :3, :3], raybundle.directions[..., None]).squeeze()
-
-            # Apply pose correction to rays
-            raybundle.directions = torch.bmm(H_cors[:, :3, :3], raybundle.directions[..., None]).squeeze()
-            raybundle.origins = raybundle.origins + H_cors[:, :3, 3]
+        if self.config.optimize_intrinsics:
+            r = raybundle.directions[..., :2].norm(dim=-1, keepdim=True)
+            r2 = r**2.0
+            r4 = r2**2.0
+            radial = (
+                1.0
+                + r2 * self.D_adjustment[raybundle.camera_indices, 0]
+                + r4 * self.D_adjustment[raybundle.camera_indices, 1]
+            )
+            raybundle.directions = raybundle.directions * torch.cat(
+                (radial, radial, torch.ones((*radial.shape[:-1], 1), device=radial.device, dtype=radial.dtype)), dim=-1
+            )
+        # Get ray directions in camera space using corrected intrinsics matrix
+        raybundle.directions = torch.bmm(torch.inverse(K_cors), raybundle.directions[..., None]).squeeze()
+        raybundle.directions = raybundle.directions / raybundle.directions.norm(dim=-1, keepdim=True)
+        # Transform rays back to world space
+        raybundle.directions = torch.bmm(Hs[..., :3, :3], raybundle.directions[..., None]).squeeze()
+        # Apply pose correction to rays
+        raybundle.directions = torch.bmm(H_cors[:, :3, :3], raybundle.directions[..., None]).squeeze()
+        raybundle.origins = raybundle.origins + H_cors[:, :3, 3]
 
     def apply_to_camera(self, camera: Cameras) -> torch.Tensor:
         """Apply the pose correction to the world-to-camera matrix in a Camera object"""

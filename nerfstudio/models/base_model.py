@@ -129,7 +129,7 @@ class Model(nn.Module):
             Outputs of model. (ie. rendered colors)
         """
 
-    def forward(self, ray_bundle: Union[RayBundle, Cameras]) -> Dict[str, Union[torch.Tensor, List]]:
+    def forward(self, ray_bundle: Union[RayBundle, Cameras], val=False) -> Dict[str, Union[torch.Tensor, List]]:
         """Run forward starting with a ray bundle. This outputs different things depending on the configuration
         of the model and whether or not the batch is provided (whether or not we are training basically)
 
@@ -140,7 +140,7 @@ class Model(nn.Module):
         if self.collider is not None:
             ray_bundle = self.collider(ray_bundle)
 
-        return self.get_outputs(ray_bundle)
+        return self.get_outputs(ray_bundle, val)
 
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
         """Compute and returns metrics.
@@ -163,7 +163,7 @@ class Model(nn.Module):
         """
 
     @torch.no_grad()
-    def get_outputs_for_camera(self, camera: Cameras, obb_box: Optional[OrientedBox] = None) -> Dict[str, torch.Tensor]:
+    def get_outputs_for_camera(self, camera: Cameras, obb_box: Optional[OrientedBox] = None, idx=0, val=False) -> Dict[str, torch.Tensor]:
         """Takes in a camera, generates the raybundle, and computes the output of the model.
         Assumes a ray-based model.
 
@@ -171,11 +171,12 @@ class Model(nn.Module):
             camera: generates raybundle
         """
         return self.get_outputs_for_camera_ray_bundle(
-            camera.generate_rays(camera_indices=0, keep_shape=True, obb_box=obb_box)
+            camera.generate_rays(camera_indices=idx, keep_shape=True, obb_box=obb_box),
+            val
         )
 
     @torch.no_grad()
-    def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
+    def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle, val=False) -> Dict[str, torch.Tensor]:
         """Takes in camera parameters and computes the output of the model.
 
         Args:
@@ -192,7 +193,7 @@ class Model(nn.Module):
             ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
             # move the chunk inputs to the model device
             ray_bundle = ray_bundle.to(self.device)
-            outputs = self.forward(ray_bundle=ray_bundle)
+            outputs = self.forward(ray_bundle=ray_bundle, val=val)
             for output_name, output in outputs.items():  # type: ignore
                 if not isinstance(output, torch.Tensor):
                     # TODO: handle lists of tensors as well
