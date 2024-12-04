@@ -81,3 +81,37 @@ def normalize(poses: Float[Tensor, "*batch 3 4"]) -> Float[Tensor, "*batch 3 4"]
     pose_copy[..., :3, 3] /= torch.max(torch.abs(poses[..., :3, 3]))
 
     return pose_copy
+
+import torch
+
+def inv_sqrtm(matrix, normalize_eigvals=False):
+    """
+    Takes the inverse matrix square root of a positive semi-definite (PSD) matrix, supporting batched inputs.
+
+    Args:
+        matrix (torch.Tensor): A PSD matrix of shape (..., d, d), where ... represents batch dimensions.
+        normalize_eigvals (bool): If True, normalize the eigenvalues by the geometric mean.
+
+    Returns:
+        torch.Tensor: The inverse square root of the matrix, shape (..., d, d).
+        tuple: A tuple (eigvec, eigval), where eigvec are the eigenvectors and eigval are the eigenvalues.
+    """
+    # Eigenvalue decomposition for batched matrices
+    eigval, eigvec = torch.linalg.eigh(matrix)  # eigval: (..., d), eigvec: (..., d, d)
+
+    # Normalize eigenvalues by the geometric mean if required
+    if normalize_eigvals:
+        log_eigval = torch.log(eigval)
+        mean_log_eigval = log_eigval.mean(dim=-1, keepdim=True)  # Shape: (..., 1)
+        eigval = torch.exp(log_eigval - mean_log_eigval)  # Shape: (..., d)
+
+    # Compute scaling (1 / sqrt(eigenvalues)), with clamping for numerical stability
+    scaling = 1.0 / torch.sqrt(eigval.clamp(min=1e-12))  # Shape: (..., d)
+    scaling = scaling.unsqueeze(-2)  # Reshape to (..., 1, d) for broadcasting
+
+    # Compute the inverse square root matrix
+    sqrtm_mat = eigvec @ (scaling * eigvec.transpose(-2, -1))  # Shape: (..., d, d)
+
+    return sqrtm_mat, (eigvec, eigval)
+
+

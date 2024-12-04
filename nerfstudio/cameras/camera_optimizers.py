@@ -96,32 +96,47 @@ class CameraOptimizerConfig(InstantiateConfig):
             warnings.warn("above message coming from", FutureWarning, stacklevel=3)
 
 class CameraPreconditioner(nn.Module):
-    def __init__(self):
+
+    config: CameraOptimizerConfig
+
+    def __init__(self, config: CameraOptimizerConfig):
         super().__init__()
-        self.precondition_num_points = 1000  # The number of points used to compute the preconditioning matrix.
+        self.config = config
+        self.precondition_num_points = 10  # The number of points used to compute the preconditioning matrix.
         self.precondition_near = 1  # The near plane depth of the point sampling frustum.
         self.precondition_far = 1000  # The far plane depth of the point sampling frustum.
+
+        #TODO: Fix the values based on CamP code
+        self.precondition_diagonal_absolute_padding = 1e-8
+        self.precondition_diagonal_relative_padding_scale = 1e-1
 
     def _unproject_points(self, points, depths, cameras):
         """
             Unproject 2D pixel coordinates to depth-scaled 3D points.
-            Note: points_3d is returned in camera coordinates.
         """
         K_inverse = torch.linalg.inv(cameras.get_intrinsics_matrices())
 
         # Unproject points into normalized camera coordinates
         points = torch.cat([points, torch.ones((points.shape[0],points.shape[1],1))], dim=-1)
-        points = (K_inverse @ points.transpose(1,2)).transpose(1,2)
+        points_norm = (K_inverse @ points.transpose(1,2)).transpose(1,2)
 
-        # scale by depth (P2 -> R3)
-        points_3d = points * depths.unsqueeze(-1)
+        # scale by depth (norm P3 -> R3)
+        points_3d = points_norm * depths.unsqueeze(-1)
+        test_pixels = self._project_points(torch.zeros((len(cameras), 6)), points_3d, cameras, in_camera_frame=True)
+        assert torch.allclose(test_pixels, points[..., :2], atol=0.01, rtol=0), "Projection-Unprojection works fine."
 
-        # # transform to world coordinates
-        # points_3d = torch.cat([points_3d, torch.ones(points_3d.shape[0],points_3d.shape[1],1)], dim=-1)
-        # c2ws = self.cameras.camera_to_worlds
-        # points_3d = torch.matmul(c2ws, points_3d.transpose(1,2)).transpose(1,2)
+
+        # transform to world coordinates
+        points_3d = torch.cat([points_3d, torch.ones(points_3d.shape[0],points_3d.shape[1],1)], dim=-1)
+        c2ws = cameras.camera_to_worlds
+        points_3d = torch.matmul(c2ws, points_3d.transpose(1,2)).transpose(1,2)
+
+        # for testing purposes
+        test_pixels = self._project_points(torch.zeros((len(cameras), 6)), points_3d, cameras)
+        assert torch.allclose(test_pixels, points[..., :2], atol=0.01, rtol=0), "Coordinate transformation is buggy."
 
         return points_3d
+        
 
     def _create_points_from_frustum(self, cameras):
         """
@@ -147,87 +162,257 @@ class CameraPreconditioner(nn.Module):
         # unproject to get 3D points, keep in camera space for ease of calculations later
         return self._unproject_points(frustum_pixels, depths, cameras)
 
-    def _project_points(self, camera_params, points_3d, cameras):
+    def _update_intrinsincs(self, cameras, camera_params):
+        """
+            Update camera intrinsics based on camera parameters.
+        """
+        K_corrected = cameras.get_intrinsics_matrices().to(camera_params.device)
+        D_corrected = torch.zeros(2, device=cameras.device).repeat(K_corrected.shape[0], 1)
+
+        if not self.config.optimize_intrinsics:
+            pass
+        elif self.config.mode == "SE3WithFocalIntrinsics":
+            K_adjustment = camera_params[:, 6:10]
+            D_adjustment = camera_params[:, 10:]
+
+            K_corrected[:, 0, 0] *= torch.exp(K_adjustment[:, 0])
+            K_corrected[:, 1, 1] *= torch.exp(K_adjustment[:, 1])
+            K_corrected[:, 0, 2] += K_adjustment[:, 2]
+            K_corrected[:, 1, 2] += K_adjustment[:, 3]
+
+            D_corrected[:, 0] += D_adjustment[:, 0]
+            D_corrected[:, 1] += D_adjustment[:, 1]
+            
+        elif self.config.mode == "SCNeRF":
+            K_adjustment = camera_params[:, 9:13]
+            D_adjustment = camera_params[:, 13:]
+
+            K_corrected[:, 0, 0] += torch.exp(K_adjustment[:, 0])
+            K_corrected[:, 1, 1] += torch.exp(K_adjustment[:, 1])
+            K_corrected[:, 0, 2] += K_adjustment[:, 2]
+            K_corrected[:, 1, 2] += K_adjustment[:, 3]
+            D_corrected[:, 0] += D_adjustment[:, 0]
+            D_corrected[:, 1] += D_adjustment[:, 1]
+        elif self.config.mode == "FocalPoseWithIntrinsics":
+            K_adjustment = camera_params[:, 9:12]
+            D_adjustment = camera_params[:, 12:]
+
+            K_corrected[:, 0, 0] *= torch.exp(K_adjustment[:, 0])
+            K_corrected[:, 1, 1] *= torch.exp(K_adjustment[:, 0])
+            K_corrected[:, 0, 2] += K_adjustment[:, 1]
+            K_corrected[:, 1, 2] += K_adjustment[:, 2]
+            D_corrected[:, 0] += D_adjustment[:, 0]
+            D_corrected[:, 1] += D_adjustment[:, 1]
+        else:
+            assert_never(self.config.mode)
+        
+        return K_corrected, D_corrected
+    
+    def _update_extrinsics(self, cameras, camera_params):
+        """
+            Update camera extrinsics based on camera parameters.
+        """
+        if self.config.mode == "SO3xR3":
+            pose_adjustment = camera_params[:, :6]
+            pose_corrected = exp_map_SO3xR3(pose_adjustment)
+        elif self.config.mode == "SE3":
+            pose_adjustment = camera_params[:, :6]
+            pose_corrected = exp_map_SE3(pose_adjustment)
+        elif self.config.mode == "SE3WithFocalIntrinsics":
+            pose_adjustment = camera_params[:, :6]
+            pose_corrected = exp_map_SE3(pose_adjustment)
+        elif self.config.mode == "SCNeRF":
+            # slice the relevant parts of the camera adjustment
+            pose_adjustment = camera_params[:, :9]
+
+            # extract rotation matrix from 1st 6 elements
+            R = get_rotation_matrix_from_6d_vector(pose_adjustment[:, 0:6])
+            translation_vector = pose_adjustment[:, 6:9]
+            pose_corrected = torch.zeros(
+                translation_vector.shape[0],
+                3,
+                4,
+                dtype=translation_vector.dtype,
+                device=translation_vector.device,
+            )
+            pose_corrected[:, :3, :3] = R
+            pose_corrected[:, :3, 3] = translation_vector
+        elif self.config.mode == "FocalPoseWithIntrinsics":
+            Ks = cameras.get_intrinsics_matrices()
+            c2ws = cameras.camera_to_worlds
+            pose_adjustment = camera_params[:, :9]
+            K_adjustment = camera_params[:, 9:12]
+
+            R = get_rotation_matrix_from_6d_vector(pose_adjustment[:, 0:6])
+            vx = pose_adjustment[:, 6]
+            vy = pose_adjustment[:, 7]
+            vz = pose_adjustment[:, 8]
+            f = Ks[indices, 0, 0]
+            
+            x = c2ws[:, 0, 3]
+            y = c2ws[:, 1, 3] 
+            z = c2ws[:, 2, 3]
+
+            f_new = torch.exp(K_adjustment[:, 0]) * f
+            z_new = torch.exp(vz) * z
+            x_new = (vx / f_new + x / z) * z_new
+            y_new = (vy / f_new + y / z) * z_new
+
+            trans = torch.stack([x_new - x, y_new - y, z_new - z], dim=1)
+            pose_corrected = torch.zeros(
+                    R.shape[0],
+                    3,
+                    4,
+                    dtype=R.dtype,
+                    device=R.device,
+                )
+
+            pose_corrected[:, :3, :3] = R  # Set the rotation part
+            pose_corrected[:, :3, 3] = trans  # Set the translation part
+        else:
+            assert_never(self.config.mode)
+
+        c2ws = cameras.camera_to_worlds.to(pose_corrected.device)
+        pose_corrected = pose_utils.multiply(c2ws, pose_corrected)  # Shape [num_cameras, 3, 4]
+
+        # During camP initialization, pose_corrected is the same as original cameras as deltas are zero
+        # assert torch.allclose(c2ws, pose_corrected, atol=0.01, rtol=0), "Pose correction is buggy."
+
+        return pose_corrected
+
+    def _update_camera(self, cameras, camera_params):
+        """
+            Update camera intrinsics and extrinsics based on camera parameters.
+        """
+        
+        pose_corrected = self._update_extrinsics(cameras, camera_params)
+        K_corrected, D_corrected = self._update_intrinsincs(cameras, camera_params)
+
+        return pose_corrected, K_corrected, D_corrected
+
+    def _project_points(self, camera_params, points_3d, cameras, in_camera_frame=False):
         """
             Project 3D points to 2D pixel coordinates.
-            Note: points_3d is already in camera coordinates.
-            # TODO: This is an implementation of the SE(3)+focal length projection equation.
-                    In the future, we should make this an abstact method, to be defined in child classes.
         """
-        # # Transform to camera coordinates
-        # points_3d = torch.cat([points_3d, torch.ones(points_3d.shape[0],points_3d.shape[1],1)], dim=-1)
-        # c2ws = self.cameras.camera_to_worlds
-        # points_3d = torch.matmul(c2ws, points_3d.transpose(1,2)).transpose(1,2)
+        pose_corrected, K_corrected, D_corrected = self._update_camera(cameras, camera_params)  # ensure camera parameters gradients
+        if in_camera_frame:
+            pose_corrected = torch.eye(4, device=cameras.device)[None, :3, :4].repeat(len(cameras), 1, 1)
 
-        # get camera intrinsics
-        # TODO: apply camera correction updates
-        K = cameras.get_intrinsics_matrices()
+        # Optional assertion
+        # if not in_camera_frame:
+        #     assert torch.allclose(cameras.camera_to_worlds, pose_corrected, atol=0.01, rtol=0), "Pose correction is buggy."
+        
+        # convert c2w correction to w2c correction
+        pose_corrected = pose_utils.inverse(pose_corrected)
 
-        # project to image space
-        # points_3d = torch.cat([points_3d, torch.ones(points_3d.shape[0],points_3d.shape[1],1)], dim=-1)
-        pixels = torch.matmul(K, points_3d.transpose(1,2)).transpose(1,2)
+        # apply perspective projection correction to image space
+        points_3d = torch.cat([points_3d, torch.ones((points_3d.shape[0],points_3d.shape[1],1),device=points_3d.device)], dim=-1)
+        points_3d = torch.matmul(pose_corrected, points_3d.transpose(1,2)).transpose(1,2)
+        pixels = torch.matmul(K_corrected, points_3d.transpose(1,2)).transpose(1,2)
         pixels = pixels/pixels[..., 2, None]
 
-        # un-homogenize
+        # Do radial distortion correction
+        # r = raybundle.directions[..., :2].norm(dim=-1, keepdim=True)
+        r = pixels[..., :2].norm(dim=-1, keepdim=True)
+        r2 = r**2.0
+        r4 = r2**2.0
+        radial = (
+            1.0
+            + r2 * D_corrected[:, None, 0].unsqueeze(-1)
+            + r4 * D_corrected[:, None, 1].unsqueeze(-1)
+        )
+        pixels = pixels * torch.cat(
+            (radial, radial, torch.ones((*radial.shape[:-1], 1), device=radial.device, dtype=radial.dtype)), dim=-1
+        )
+        pixels = pixels/pixels[..., 2, None]
+
         return pixels[..., :2]
 
-    def _compute_jacobian(self, fn, x, *args):
+    def _compute_jacobian(self, fn, camera_params, points_3d, cameras):
         """
             Compute the Jacobian of a function fn at x.
             Returns the Jacobian matrix and projected pixels.
             TODO: Re-check the implementation of this method.
         """
-        points = args[0]
-        points = points.detach().requires_grad_(True)
-        nc, m, _ = points.shape  # Number of cameras, number of points
-        x = x.detach().requires_grad_(True)  # Ensure x is differentiable
+        points_3d = points_3d.detach().requires_grad_(True)
+        nc, m, _ = points_3d.shape  # Number of cameras, number of points
+        camera_params = camera_params.detach().requires_grad_(True)  # Ensure x is differentiable
 
         # project 3D points to 2D pixel coordinates
-        y = fn(x, *args)  # Expected shape: (nc, m, 2)
+        projected_pixels = fn(camera_params, points_3d, cameras)  # Expected shape: (nc, m, 2)
+
+        # assert that projected pixels are within image bounds as 4 separate conditions
+        assert torch.all(projected_pixels[..., 0] >= -0.01), "Projected pixels are out of bounds."
+        assert torch.all(projected_pixels[..., 0] < cameras.height[0]+0.01), "Projected pixels are out of bounds."
+        assert torch.all(projected_pixels[..., 1] >= -0.01), "Projected pixels are out of bounds."
+        assert torch.all(projected_pixels[..., 1] < cameras.width[0]+0.01), "Projected pixels are out of bounds."
 
         # Initialize the Jacobian matrix
-        jacobian = torch.zeros(nc, m, 2, x.shape[-1], device=x.device)  # Shape: (nc, m, 2, x.shape[-1])
+        jacobian = torch.zeros(nc, m, 2, camera_params.shape[-1], device=camera_params.device)  # Shape: (nc, m, 2, x.shape[-1])
 
-        # Compute gradients for each 2D point across cameras
-        # TODO: Check if this can be parallelized
-        # TODO: Fix x.grad None because x:camera_params is not being used for projection. Refer to previous function TODO
-        # Temporarily commented out until issue is fixed.
-        
-        # for c in range(nc):  
-        #     for i in range(m): 
-        #         for j in range(2):
-        #             if x.grad is not None:
-        #                 x.grad.zero_()
+        camera_params = camera_params.to("cuda")
+        points_3d = points_3d.to("cuda")
+        cameras = cameras.to("cuda")
 
-        #             # Backpropagate the gradient of y[c, i, j] w.r.t. x[c]
-        #             y[c, i, j].backward(retain_graph=True)
-        #             jacobian[c, i, j] = x.grad[c]
+        def wrapped_fn(camera_params_batch, points_3d_batch, cameras_batch):
+            return fn(camera_params_batch, points_3d_batch, cameras_batch).reshape(-1, 20)  # Flatten to 20 outputs per camera
 
-        return jacobian, y
+        # Initialize a list to collect Jacobians
+        jacobians = []
 
-    def _compute_approximate_hessian(self, camera_params, cameras, points_3d):
+        # Loop through each batch (camera)
+        for i in range(camera_params.shape[0]):
+            camera_params_batch = camera_params[None, i]
+            points_3d_batch = points_3d[None, i]
+            cameras_batch = cameras[None, i]
+
+            # Compute the Jacobian for this batch
+            jacobian = torch.autograd.functional.jacobian(
+                lambda p: wrapped_fn(p, points_3d_batch, cameras_batch).reshape(-1),  # Flatten 20 outputs for this camera
+                camera_params_batch,
+                create_graph=True
+            )
+            jacobians.append(jacobian.squeeze(1))
+
+        # Stack Jacobians for all cameras
+        jacobians = torch.stack(jacobians, dim=0)
+
+        return jacobians, projected_pixels
+
+    def _compute_approximate_hessian(self, camera_params, cameras):
         """
             Compute the approximate Hessian matrix.
             TODO: Finish implementing this method.
         """
+        points_3d = self._create_points_from_frustum(cameras)
         j, pixels = self._compute_jacobian(self._project_points, camera_params, points_3d, cameras)
 
-        # TODO: ignore pixels outside of camera viewpoint
-        pixels = None
-        jtj = None
+        # TODO: Zero out the gradients for pixels that are outside of camera viewpoint -> heavy distortion
+        # pixels = None
+        # jtj = None
 
-        # TODO: do xTx stuff, check for valid pixels
+        jtj = j.transpose(1,2) @ j
         return jtj
 
-    def _calculate_jtj(self, camera_params, cameras):
-        """Compute the approximate Hessian matrix"""
-        points_3d = self._create_points_from_frustum(cameras)
-        jtj = self._compute_approximate_hessian(camera_params, cameras, points_3d)
-        return jtj
+    def _precondition_with_padding(self, jtj, normalize_eigvals=False):
+        """
+        Applies preconditioning by adding diagonal padding and computing the inverse square root matrix.
+        """
+        diagonal_absolute_padding = self.precondition_diagonal_absolute_padding * torch.ones(jtj.shape[-1], device=jtj.device)
+        diagonal_relative_padding = self.precondition_diagonal_relative_padding_scale * jtj.diagonal(dim1=-2, dim2=-1)  # Shape: [204, 6]
+
+        diagonal_padding = torch.diag(torch.maximum(diagonal_absolute_padding, diagonal_relative_padding))
+        
+        padded_matrix = jtj + diagonal_padding
+        matrix = pose_utils.inv_sqrtm(padded_matrix, normalize_eigvals=normalize_eigvals)
+        return matrix
+
         
     def get_camera_preconditioner(self, camera_params, cameras):
         """Get the preconditioner for the camera parameters"""
-        return self._calculate_jtj(camera_params, cameras)
+        jtj = self._compute_approximate_hessian(camera_params, cameras)  
+        P, _ = self._precondition_with_padding(jtj)
+        return P
         
 
 
@@ -270,8 +455,12 @@ class CameraOptimizer(nn.Module):
 
         # temporarily re-setting config for debugging
         # Eliminate this code later
-        self.config.mode = "SE3WithFocalIntrinsics"
-        p_size = 12
+
+        self.config.mode = "SO3xR3"
+        psize = 6
+
+        # self.config.mode = "SE3WithFocalIntrinsics"
+        # psize = 12
 
         # self.config.mode = "SCNeRF"
         # p_size = 15
@@ -288,10 +477,8 @@ class CameraOptimizer(nn.Module):
             # only optimize pose
             # forward() function expects pose_adjustment to be defined but we want it to be called camera_adjustment
             #TODO: Fix this bug
-            raise NotImplementedError("Some bugs need to be fixed")
-
-            # self.pose_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 6), device=device))
-            # self.config.optimize_intrinsics = False
+            self.camera_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 6), device=device))
+            self.config.optimize_intrinsics = False
         elif self.config.mode == "SE3WithFocalIntrinsics":
             # optimize pose, fx, fy, cx, cy
             self.camera_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 12), device=device))
@@ -311,9 +498,9 @@ class CameraOptimizer(nn.Module):
 
         # initialize preconditioner and calculate P matrix
         if self.config.use_preconditioning:
-            self.preconditioner = CameraPreconditioner()
-            # self.P_matrix = self.preconditioner.get_camera_preconditioner(self.camera_adjustment.detach(), cameras)
-            self.P_matrix = torch.eye(psize, device=device)[None, ...].repeat(num_cameras, 1, 1)  # override with dummy P matrix for debugging
+            self.preconditioner = CameraPreconditioner(self.config)
+            self.P_matrix = self.preconditioner.get_camera_preconditioner(self.camera_adjustment.detach(), cameras)
+            # self.P_matrix = torch.eye(psize, device=device)[None, ...].repeat(num_cameras, 1, 1)  # override with dummy P matrix for debuggingx
 
     def forward(
         self,
@@ -344,14 +531,16 @@ class CameraOptimizer(nn.Module):
         if self.config.mode == "off":
             pass
         elif self.config.mode == "SO3xR3":
+            self.pose_adjustment = preconditioned_camera_adjustment*1
             outputs.append(exp_map_SO3xR3(self.pose_adjustment[indices, :]))
         elif self.config.mode == "SE3":
+            self.pose_adjustment = preconditioned_camera_adjustment*1
             outputs.append(exp_map_SE3(self.pose_adjustment[indices, :]))
         elif self.config.mode == "SE3WithFocalIntrinsics":
             # slice the relevant parts of the camera adjustment
-            self.K_adjustment = preconditioned_camera_adjustment[:, :4]
-            self.D_adjustment = preconditioned_camera_adjustment[:, 4:6]
-            self.pose_adjustment = preconditioned_camera_adjustment[:, 6:]
+            self.pose_adjustment = preconditioned_camera_adjustment[:, :6]
+            self.K_adjustment = preconditioned_camera_adjustment[:, 6:10]
+            self.D_adjustment = preconditioned_camera_adjustment[:, 10:]
 
             # update it to only use pose part (first 6 elements)
             outputs.append(exp_map_SE3(self.pose_adjustment[indices, :]))
@@ -476,7 +665,7 @@ class CameraOptimizer(nn.Module):
                 raybundle.directions = raybundle.directions / -raybundle.directions[..., 2:3].repeat(1, 3)
 
                 # Do radial distortion correction
-                r = raybundle.directions[..., :2].norm(dim=-1, keepdim=True)
+                r = raybundle.directions[..., :2].norm(dim=-1, keepdim=True)  # 4096,1
                 r2 = r**2.0
                 r4 = r2**2.0
                 radial = (
