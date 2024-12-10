@@ -59,6 +59,41 @@ def exp_map_SO3xR3(tangent_vector: Float[Tensor, "b 6"]) -> Float[Tensor, "b 3 4
     ret[:, :3, 3] = tangent_vector[:, :3]
     return ret
 
+def exp_map_SO3(tangent_vector: Float[Tensor, "b 3"]) -> Float[Tensor, "b 3 4"]:
+    """Compute the exponential map of the direct product group `SO(3) x R^3`.
+
+    This can be used for learning pose deltas on SE(3), and is generally faster than `exp_map_SE3`.
+
+    Args:
+        tangent_vector: Tangent vector; length-3 translations, followed by an `so(3)` tangent vector.
+    Returns:
+        [R|t] transformation matrices.
+    """
+    # code for SO3 map grabbed from pytorch3d and stripped down to bare-bones
+    log_rot = tangent_vector
+    nrms = (log_rot * log_rot).sum(1)
+    rot_angles = torch.clamp(nrms, 1e-4).sqrt()
+    rot_angles_inv = 1.0 / rot_angles
+    fac1 = rot_angles_inv * rot_angles.sin()
+    fac2 = rot_angles_inv * rot_angles_inv * (1.0 - rot_angles.cos())
+    skews = torch.zeros((log_rot.shape[0], 3, 3), dtype=log_rot.dtype, device=log_rot.device)
+    skews[:, 0, 1] = -log_rot[:, 2]
+    skews[:, 0, 2] = log_rot[:, 1]
+    skews[:, 1, 0] = log_rot[:, 2]
+    skews[:, 1, 2] = -log_rot[:, 0]
+    skews[:, 2, 0] = -log_rot[:, 1]
+    skews[:, 2, 1] = log_rot[:, 0]
+    skews_square = torch.bmm(skews, skews)
+
+    ret = torch.zeros(tangent_vector.shape[0], 3, 3, dtype=tangent_vector.dtype, device=tangent_vector.device)
+    ret[:, :3, :3] = (
+        fac1[:, None, None] * skews
+        + fac2[:, None, None] * skews_square
+        + torch.eye(3, dtype=log_rot.dtype, device=log_rot.device)[None]
+    )
+
+    return ret
+
 
 def exp_map_SE3(tangent_vector: Float[Tensor, "b 6"]) -> Float[Tensor, "b 3 4"]:
     """Compute the exponential map `se(3) -> SE(3)`.
